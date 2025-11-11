@@ -1,12 +1,11 @@
 import telebot
 import requests
 import logging
+import sqlite3
 import os
 import re
 from dotenv import load_dotenv
 from flask import Flask, request
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
 # .env fayLdan load qilish
 load_dotenv()
@@ -20,10 +19,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-DATABASE_URL = os.getenv("DATABASE_URL")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
 FLASK_PORT = int(os.getenv("FLASK_PORT", 8000))
+DB_FILE = "movies.db"
 
 # Bot yaratish
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
@@ -31,35 +30,20 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 # Flask app (webhook uchun)
 app = Flask(__name__)
 
-# Database bilan bog'lanish
-def get_db_connection():
-    """PostgreSQL database bilan bog'lanish"""
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except Exception as e:
-        logger.error(f"Database xato: {e}")
-        return None
-
 # Database yaratish
 def init_db():
     """Ma'lumotlar bazasini yaratish"""
     try:
-        conn = get_db_connection()
-        if not conn:
-            logger.error("Database ga bog'lanish xato")
-            return
-        
+        conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS movies
-                     (id SERIAL PRIMARY KEY,
+                     (id INTEGER PRIMARY KEY,
                       title TEXT UNIQUE,
                       message_id INTEGER,
                       channel_id INTEGER)''')
         conn.commit()
-        c.close()
         conn.close()
-        logger.info("Database tayyoq")
+        logger.info("✅ Database tayyoq")
     except Exception as e:
         logger.error(f"Database init xato: {e}")
 
@@ -68,49 +52,29 @@ init_db()
 def add_movie_to_db(title, message_id, channel_id):
     """Kinoni ma'lumotlar bazasiga qo'shish"""
     try:
-        conn = get_db_connection()
-        if not conn:
-            return False
-        
+        conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("INSERT INTO movies (title, message_id, channel_id) VALUES (%s, %s, %s)",
+        c.execute("INSERT INTO movies (title, message_id, channel_id) VALUES (?, ?, ?)",
                   (title.lower(), message_id, channel_id))
         conn.commit()
-        c.close()
         conn.close()
         return True
-    except psycopg2.IntegrityError:
-        if conn:
-            conn.close()
+    except sqlite3.IntegrityError:
         return False  # Kino allaqachon bor
     except Exception as e:
         logger.error(f"DB xato: {e}")
-        if conn:
-            conn.close()
         return False
 
 def search_movie_in_db(movie_name):
-    """Qisman va seriyali qidiruv (sodda va aniqroq).
-
-    Algoritm:
-    1) Agar foydalanuvchi oxirida raqam yozgan bo'lsa (masalan "Flesh 76"), avvalo
-       baza ichidan ushbu asosiy nom bilan birga aynan shu raqam mavjudligini qidiradi
-       (title ichidagi raqamlarni tekshiradi). Agar topilsa, faqat shu natijalarni qaytaradi.
-    2) Agar to'g'ri raqamli natija topilmasa, baza ichidan asosiy nom bo'yicha nomerli
-       nomlarni topib, ularni raqamga yaqinlik bo'yicha saralaydi.
-    3) Agar raqam aniqlanmasa yoki yuqoridagi hech narsa topilmasa, oddiy qisman
-       (OR-LIKE) qidiruvni bajaradi va natijalarni sodda o'xshashlikka qarab saralaydi.
-    """
+    """Qisman va seriyali qidiruv"""
     try:
-        conn = get_db_connection()
-        if not conn:
-            return []
-        
-        c = conn.cursor(cursor_factory=RealDictCursor)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+
         query_raw = movie_name.strip()
         low = query_raw.lower()
 
-        # 1) Seriya raqamini aniqlash: oxirida joylashgan raqam (masalan "flesh 76")
+        # Seriya raqamini aniqlash
         m = re.search(r"^(.+?)\s+(\d{1,4})$", query_raw.strip())
         if m:
             base = m.group(1).strip().lower()
@@ -119,65 +83,53 @@ def search_movie_in_db(movie_name):
             except:
                 target_num = None
 
-            # O'sha base bilan mos keluvchi barcha yozuvlarni olish
-            c.execute("SELECT id, message_id, channel_id, title FROM movies WHERE LOWER(title) LIKE %s",
-                     (f"%{base}%",))
+            # Base bilan mos keluvchi kinolarni olish
+            c.execute("SELECT id, message_id, channel_id, title FROM movies WHERE LOWER(title) LIKE ?", (f"%{base}%",))
             rows = c.fetchall()
 
             exact = []
             close = []
             for row in rows:
-                title = row['title']
+                title = row[3]
                 nums = [int(x) for x in re.findall(r"\d+", title)]
                 if nums:
                     if target_num in nums:
-                        exact.append((row['id'], row['message_id'], row['channel_id'], row['title']))
+                        exact.append(row)
                     else:
-                        # eng yaqin raqam farqini hisobla
                         dif = min(abs(n - target_num) for n in nums)
-                        close.append((dif, (row['id'], row['message_id'], row['channel_id'], row['title'])))
+                        close.append((dif, row))
 
             if exact:
-                # exact natijalarni birinchi qaytar
-                c.close()
                 conn.close()
                 return exact
 
             if close:
-                # yaqinlik bo'yicha saralab qaytar
                 close_sorted = [r for d, r in sorted(close, key=lambda x: x[0])]
-                c.close()
                 conn.close()
                 return close_sorted
 
-            # agar topilmasa, tushunarli rollback: davom ettiramiz umumiy qidiruvga
-
-        # 2) Umumiy qisman qidiruv (so'zlarni OR bilan qidirish)
+        # Umumiy qisman qidiruv
         search_terms = [t for t in low.split() if len(t) > 1]
         if not search_terms:
-            c.close()
             conn.close()
             return []
 
         conditions = []
         params = []
         for term in search_terms:
-            conditions.append("LOWER(title) LIKE %s")
+            conditions.append("LOWER(title) LIKE ?")
             params.append(f"%{term}%")
 
         sql = "SELECT id, message_id, channel_id, title FROM movies WHERE " + " OR ".join(conditions) + " LIMIT 100"
         c.execute(sql, params)
         results = c.fetchall()
-        c.close()
         conn.close()
 
-        # Soddaroq saralash: qancha ko'proq term topilsa yuqori
         def score(row):
-            title = row['title'].lower()
+            title = row[3].lower()
             return sum(1 for t in search_terms if t in title)
 
-        sorted_results = [(r['id'], r['message_id'], r['channel_id'], r['title']) 
-                         for r in sorted(results, key=lambda r: score(r), reverse=True)]
+        sorted_results = sorted(results, key=lambda r: score(r), reverse=True)
         return sorted_results
 
     except Exception as e:
@@ -282,18 +234,11 @@ def search_command(message):
 def list_movies(message):
     """Barcha kinolarni ro'yxati tugmachalar bilan"""
     try:
-        conn = get_db_connection()
-        if not conn:
-            bot.reply_to(message, "❌ <b>Database xato</b>", parse_mode='HTML')
-            return
-        
-        c = conn.cursor(cursor_factory=RealDictCursor)
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
         c.execute("SELECT id, title FROM movies ORDER BY title LIMIT 100")
-        movies_rows = c.fetchall()
-        c.close()
+        movies = c.fetchall()
         conn.close()
-        
-        movies = [(row['id'], row['title']) for row in movies_rows]
         
         if not movies:
             bot.reply_to(message, "❌ <b>Ma'lumotlar bazasida kino yo'q</b>\n\n"
@@ -340,24 +285,17 @@ def movie_callback(call):
         # Callback_data dan kino ID'sini olish
         movie_id = int(call.data.split('_')[1])
         
-        conn = get_db_connection()
-        if not conn:
-            bot.answer_callback_query(call.id, "❌ Database xato!", show_alert=True)
-            return
-        
-        c = conn.cursor(cursor_factory=RealDictCursor)
-        c.execute("SELECT message_id, channel_id, title FROM movies WHERE id = %s", (movie_id,))
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT message_id, channel_id, title FROM movies WHERE id = ?", (movie_id,))
         result = c.fetchone()
-        c.close()
         conn.close()
         
         if not result:
             bot.answer_callback_query(call.id, "❌ Kino topilmadi!", show_alert=True)
             return
         
-        msg_id = result['message_id']
-        ch_id = result['channel_id']
-        title = result['title']
+        msg_id, ch_id, title = result
         
         # Kino yuborish
         try:
@@ -551,24 +489,17 @@ def search_movie_callback(call):
         # Callback_data dan kino ID'sini olish
         movie_id = int(call.data.split('_')[2])
         
-        conn = get_db_connection()
-        if not conn:
-            bot.answer_callback_query(call.id, "❌ Database xato!", show_alert=True)
-            return
-        
-        c = conn.cursor(cursor_factory=RealDictCursor)
-        c.execute("SELECT message_id, channel_id, title FROM movies WHERE id = %s", (movie_id,))
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT message_id, channel_id, title FROM movies WHERE id = ?", (movie_id,))
         result = c.fetchone()
-        c.close()
         conn.close()
         
         if not result:
             bot.answer_callback_query(call.id, "❌ Kino topilmadi!", show_alert=True)
             return
         
-        msg_id = result['message_id']
-        ch_id = result['channel_id']
-        title = result['title']
+        msg_id, ch_id, title = result
         
         # Kino yuborish
         try:
