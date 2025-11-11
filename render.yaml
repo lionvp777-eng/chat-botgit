@@ -1,0 +1,4 @@
+build:
+  pythonVersion: 3.11.8
+
+startCommand: gunicorn bot:app
